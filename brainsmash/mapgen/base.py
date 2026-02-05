@@ -132,7 +132,7 @@ class Base:
             batches += [n % batch_size]
 
         rs = self._rs.randint(np.iinfo(np.int32).max, size=len(batches))
-        surrs = np.row_stack(
+        surrs = np.vstack(
             Parallel(self._n_jobs)(
                 delayed(self._call_method)(i=batches[n], rs=i)
                 for n, i in enumerate(rs)
@@ -234,7 +234,7 @@ class Base:
             Random permutation of target brain map
 
         """
-        perm_idx = self._rs.random_sample((self._x.size, i)).argsort(axis=0)
+        perm_idx = self._rs.random((self._x.size, i)).argsort(axis=0)
         mask_perm = self._x.mask[perm_idx]
         x_perm = self._x.data[perm_idx]
         return np.ma.masked_array(data=x_perm, mask=mask_perm)

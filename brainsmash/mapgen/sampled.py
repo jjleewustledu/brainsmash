@@ -126,7 +126,7 @@ class Sampled:
         """
 
         rs = self._rs.randint(np.iinfo(np.int32).max, size=n)
-        surrs = np.row_stack(
+        surrs = np.vstack(
             Parallel(self._n_jobs)(
                 delayed(self._call_method)(rs=i) for i in rs
             )
