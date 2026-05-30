@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# hpc-toolkit pre-push hook (minimal safety only).
+#
+# Runs:
+#   1. Differential pytest — test files mirroring changed src/ files
+#      (vs origin/${DEFAULT_BRANCH}), fail-fast.
+#   2. pytest -m "invariant or security" — load-bearing pins, if any
+#      tests carry those markers.
+#   3. Pattern A′ HPC-CI auto-fire — on a successful push to origin of
+#      a feature/fix/experiment/chore branch, submit hpc/ci_pr.sh in
+#      the background. Opt-out: SKIP_HPC_CI=1.
+#
+# Project-specific gates belong in the project's OWN hooks/pre-push.
+#
+# Install: bash scripts/install_hooks.sh (when present) or
+#          ln -sf ../../hooks/pre-push .git/hooks/pre-push
+# Bypass:  git push --no-verify
+
+set -uo pipefail
+
+_PROJECT_CONF="$(git rev-parse --show-toplevel 2>/dev/null)/hpc/project.conf"
+if [ -f "$_PROJECT_CONF" ]; then
+    # shellcheck source=../hpc/project.conf
+    . "$_PROJECT_CONF"
+fi
+CONDA_ENV="${CONDA_ENV:-base}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+PYTHON_PKG="${PYTHON_PKG:-${PROJECT_NAME:-app}}"
+
+echo "═══ pre-push (toolkit, conda env: ${CONDA_ENV}) ═══"
+
+# Read the push refspecs from stdin so we can (a) detect feature-branch
+# pushes for the HPC-CI auto-fire and (b) skip on no-op pushes.
+_PR_GATE_BRANCHES=()
+_PR_GATE_SHAS=()
+_any_ref_seen=false
+while IFS= read -r _ppline; do
+    [ -z "$_ppline" ] && continue
+    _any_ref_seen=true
+    _pp_local_sha=$(echo "$_ppline" | awk '{print $2}')
+    _pp_remote_ref=$(echo "$_ppline" | awk '{print $3}')
+    case "$_pp_remote_ref" in
+        refs/heads/feature/*|refs/heads/fix/*|refs/heads/experiment/*|refs/heads/chore/*)
+            # Skip deletions (local_sha=0000…); creations have remote_sha=0000… but
+            # a valid local_sha — those should fire the auto-fire.
+            if [ "$_pp_local_sha" != "0000000000000000000000000000000000000000" ]; then
+                _PR_GATE_BRANCHES+=("${_pp_remote_ref#refs/heads/}")
+                _PR_GATE_SHAS+=("$_pp_local_sha")
+            fi
+            ;;
+    esac
+done
+[ "$_any_ref_seen" = false ] && exit 0
+
+# ── Differential testing: tests for changed src/ + test files ────────────────
+
+CHANGED_SRC=$(git diff "origin/${DEFAULT_BRANCH}" --name-only -- "src/${PYTHON_PKG}/*.py" 2>/dev/null || true)
+CHANGED_TESTS=$(git diff "origin/${DEFAULT_BRANCH}" --name-only -- 'tests/*.py' 'tests/**/*.py' 2>/dev/null || true)
+
+DIFF_TESTS=""
+for src_file in $CHANGED_SRC; do
+    base=$(basename "$src_file" .py)
+    case "$base" in
+        __init__|_*) continue ;;
+    esac
+    test_file="tests/test_${base}.py"
+    if [ -f "$test_file" ]; then
+        DIFF_TESTS="$DIFF_TESTS $test_file"
+    fi
+done
+for tf in $CHANGED_TESTS; do
+    [ -f "$tf" ] && DIFF_TESTS="$DIFF_TESTS $tf"
+done
+DIFF_TESTS=$(echo "$DIFF_TESTS" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/^ *//;s/ *$//')
+
+if [ -n "$DIFF_TESTS" ]; then
+    echo "── differential: pytest $DIFF_TESTS ──"
+    if ! conda run --no-capture-output -n "$CONDA_ENV" \
+            python -m pytest $DIFF_TESTS -x -q --tb=short --timeout=60; then
+        DIFF_RC=$?
+        if [ "$DIFF_RC" != "5" ]; then
+            echo "✗ differential tests FAILED — fix or bypass: git push --no-verify" >&2
+            exit 1
+        fi
+    fi
+    echo "  ok differential"
+fi
+
+# ── Invariant + security marker subset ────────────────────────────────────────
+
+if conda run --no-capture-output -n "$CONDA_ENV" \
+        python -m pytest tests/ -q --tb=short -rfE -m 'invariant or security' --co \
+        >/dev/null 2>&1; then
+    if ! conda run --no-capture-output -n "$CONDA_ENV" \
+            python -m pytest tests/ -q --tb=short -rfE -m 'invariant or security'; then
+        PYTEST_RC=$?
+        if [ "$PYTEST_RC" != "5" ]; then
+            echo "✗ invariant/security tests FAILED — fix or bypass: git push --no-verify" >&2
+            exit 1
+        fi
+    fi
+    echo "  ok invariant/security"
+fi
+
+# ── Pattern A′ HPC-CI auto-fire ───────────────────────────────────────────────
+# On successful pre-push of a feature/fix/experiment/chore branch to origin,
+# submit hpc/ci_pr.sh in the background. Opt-out: SKIP_HPC_CI=1.
+# Cascade guards: $1=="origin" + SKIP_HPC_CI + parent process != ci_pr.sh.
+
+_PUSH_REMOTE_NAME="${1:-}"
+_PARENT_CMD="$(ps -o command= -p $PPID 2>/dev/null | head -c 200 || true)"
+if [ "${SKIP_HPC_CI:-0}" = "1" ]; then
+    echo "  [pattern-a′] SKIP_HPC_CI=1 — HPC CI auto-fire skipped"
+elif [ "$_PUSH_REMOTE_NAME" != "origin" ]; then
+    echo "  [pattern-a′] push remote='${_PUSH_REMOTE_NAME}' (not origin) — HPC CI auto-fire skipped"
+elif [[ "$_PARENT_CMD" == *ci_pr.sh* ]]; then
+    echo "  [pattern-a′] parent is ci_pr.sh — HPC CI auto-fire skipped (cascade guard)"
+elif [ "${#_PR_GATE_BRANCHES[@]}" -gt 0 ]; then
+    _REPO_ROOT="$(git rev-parse --show-toplevel)"
+    _CI_PR_SCRIPT="${_REPO_ROOT}/hpc/ci_pr.sh"
+    if [ -x "$_CI_PR_SCRIPT" ]; then
+        for _i in "${!_PR_GATE_BRANCHES[@]}"; do
+            _branch="${_PR_GATE_BRANCHES[$_i]}"
+            _sha="${_PR_GATE_SHAS[$_i]}"
+            _log_file="${_REPO_ROOT}/logs/ci_pr_submit_$(date +%Y%m%dT%H%M%SZ)_$(echo "$_branch" | tr '/' '_').log"
+            mkdir -p "$(dirname "$_log_file")"
+            echo "  [pattern-a′] firing hpc/ci_pr.sh ${_branch} --sha=${_sha:0:8} (background)"
+            nohup bash "$_CI_PR_SCRIPT" "$_branch" --sha="$_sha" > "$_log_file" 2>&1 &
+            disown 2>/dev/null || true
+        done
+        echo "  [pattern-a′] opt-out: SKIP_HPC_CI=1 git push origin <branch>"
+    fi
+fi
+
+echo "✓ pre-push passed"
+exit 0
