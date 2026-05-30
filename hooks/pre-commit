@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# hpc-toolkit pre-commit hook (minimal safety only).
+#
+# Runs: black --check, ruff check, gitleaks detect (if installed).
+# Project-specific gates (entropy scanners, sensitive-path lint, count
+# auto-bump, U(1) equivariance, …) belong in the project's OWN
+# hooks/pre-commit, NOT here. This toolkit hook is the safe baseline a
+# brand-new project gets via `~/.claude/hpc-toolkit/install.sh`.
+#
+# Install: bash scripts/install_hooks.sh  (when present) or
+#          ln -sf ../../hooks/pre-commit .git/hooks/pre-commit
+# Bypass:  git commit --no-verify
+
+set -euo pipefail
+
+_PROJECT_CONF="$(git rev-parse --show-toplevel 2>/dev/null)/hpc/project.conf"
+if [ -f "$_PROJECT_CONF" ]; then
+    # shellcheck source=../hpc/project.conf
+    . "$_PROJECT_CONF"
+fi
+CONDA_ENV="${CONDA_ENV:-base}"
+
+echo "═══ pre-commit (toolkit, conda env: ${CONDA_ENV}) ═══"
+
+# Staged python files (Added/Copied/Modified/Renamed). black + ruff run
+# ONLY against these so the hook never blocks a commit on pre-existing
+# unformatted files elsewhere in the tree — only the lines the operator
+# is actually staging are gated. Empty result skips both linters.
+STAGED_PY="$(git diff --cached --name-only --diff-filter=ACMR -- '*.py' 2>/dev/null || true)"
+
+# black --check (formatting). Skip if black isn't installed or no staged .py.
+if [ -n "$STAGED_PY" ] && conda run -n "$CONDA_ENV" python -c "import black" 2>/dev/null; then
+    if ! echo "$STAGED_PY" | xargs conda run -n "$CONDA_ENV" black --check --quiet; then
+        echo "✗ black --check FAILED on staged files — run: conda run -n $CONDA_ENV black <files>" >&2
+        echo "  Or bypass with: git commit --no-verify" >&2
+        exit 1
+    fi
+    echo "  ok black (staged files only)"
+fi
+
+# ruff check (linting). Skip if ruff isn't installed or no staged .py.
+if [ -n "$STAGED_PY" ] \
+   && { conda run -n "$CONDA_ENV" python -c "import ruff" 2>/dev/null \
+        || command -v ruff >/dev/null 2>&1; }; then
+    if ! echo "$STAGED_PY" | xargs conda run -n "$CONDA_ENV" ruff check; then
+        echo "✗ ruff check FAILED on staged files — run: conda run -n $CONDA_ENV ruff check <files> --fix" >&2
+        echo "  Or bypass with: git commit --no-verify" >&2
+        exit 1
+    fi
+    echo "  ok ruff (staged files only)"
+fi
+
+# gitleaks (secret scan on the staged content). Skip if not installed.
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks protect --staged --no-banner --redact; then
+        echo "✗ gitleaks FAILED — secret patterns in staged content" >&2
+        echo "  Review findings above and unstage before committing." >&2
+        echo "  Or bypass with: git commit --no-verify" >&2
+        exit 1
+    fi
+    echo "  ok gitleaks"
+else
+    echo "  (gitleaks not installed locally — skipping; install via: brew install gitleaks)"
+fi
+
+echo "✓ pre-commit passed"
+exit 0
